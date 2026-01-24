@@ -20,6 +20,18 @@ import os
 import cv2
 import pandas as pd
 
+def expand_bbox(x, y, w, h, width, height, expand_ratio=0.25):
+    new_w = w * (1 + expand_ratio)
+    new_h = h * (1 + expand_ratio)
+    
+    new_x = max(0, x - (new_w - w) / 2)
+    new_y = max(0, y - (new_h - h) / 2)
+    
+    new_x2 = min(width, x + w + (new_w - w) / 2)
+    new_y2 = min(height, y + h + (new_h - h) / 2)
+    
+    return new_x, new_y, new_x2, new_y2
+
 class NIIDataset(Dataset):
     def __init__(self, cfg, root_dir, list_file, transform=None, if_self_training=False):
         self.cfg = cfg
@@ -51,7 +63,7 @@ class NIIDataset(Dataset):
         
         image = (image-image.min())/(image.max()-image.min())
         image = (image*255).astype(np.uint8)
-
+        height, width, _ = image.shape
         # If configuration has 'get_prompt', return additional image information
         if self.cfg.get_prompt:
             image_info = {}
@@ -70,13 +82,39 @@ class NIIDataset(Dataset):
 
         masks = []
         bboxes = []
+        bboxes_corse = []
         categories = []
         gt_masks = decode_mask(torch.tensor(gt_mask[None, :, :])).numpy().astype(np.uint8)
         assert gt_masks.sum() == (gt_mask > 0).sum()
+        # 随机扰动参数，可根据需要调整
+        offset_factor = 0.1  # 偏移程度，范围0-1
+        
         for mask in gt_masks:
             masks.append(mask)
             x, y, w, h = cv2.boundingRect(mask)
-            bboxes.append([x, y, x + w, y + h])
+            
+            # 对边界框坐标进行随机扰动
+            max_offset_x = int(w * offset_factor)
+            max_offset_y = int(h * offset_factor)
+            
+            # 随机生成偏移量
+            offset_x = random.randint(-max_offset_x, max_offset_x)
+            offset_y = random.randint(-max_offset_y, max_offset_y)
+            offset_w = random.randint(-max_offset_x, max_offset_x)
+            offset_h = random.randint(-max_offset_y, max_offset_y)
+            
+            # 应用偏移并确保不超出图像边界
+            x_perturbed = max(0, min(width, x + offset_x))
+            y_perturbed = max(0, min(height, y + offset_y))
+            w_perturbed = max(1, min(width - x_perturbed, w + offset_w))
+            h_perturbed = max(1, min(height - y_perturbed, h + offset_h))
+            
+            # bboxes.append([x, y, x + w, y + h])
+            new_x, new_y, new_x2, new_y2 = expand_bbox(x_perturbed, y_perturbed, w_perturbed, h_perturbed, width, height, expand_ratio=0.0)
+            new_x_1, new_y_1, new_x2_1, new_y2_1 = expand_bbox(x_perturbed, y_perturbed, w_perturbed, h_perturbed, width, height, expand_ratio=0.0)
+            bboxes.append([new_x, new_y, new_x2, new_y2])
+            bboxes_corse.append([new_x_1, new_y_1, new_x2_1, new_y2_1])
+            # bboxes_corse = bboxes
             categories.append("0")
 
         # If self-training, apply transformations (augmented images)
@@ -87,15 +125,23 @@ class NIIDataset(Dataset):
                 image_weak, masks_weak, bboxes_weak = self.transform(image_weak, masks_weak, np.array(bboxes_weak))
                 image_strong = self.transform.transform_image(image_strong)
                 ###############
+                # print(image.shape,bboxes,'111111', bboxes_corse)
+                image_coarse = image
+                masks_coarse = masks
                 image, masks, bboxes = self.transform(image, masks, np.array(bboxes))
+                _, _, bboxes_corse = self.transform(image_coarse, masks_coarse, np.array(bboxes_corse))
+                # print(image_coarse.shape, bboxes,'222222', bboxes_corse, self.transform)
             
             bboxes = np.stack(bboxes, axis=0)
+            bboxes_corse = np.stack(bboxes_corse, axis=0)
+
             masks = np.stack(masks, axis=0)
 
             bboxes_weak = np.stack(bboxes_weak, axis=0)
             masks_weak = np.stack(masks_weak, axis=0)
             # return image_weak, image_strong, torch.tensor(bboxes_weak), torch.tensor(masks_weak).float()
-            return image, torch.tensor(bboxes), torch.tensor(masks).float(), basename, image_weak, image_strong, torch.tensor(bboxes_weak), torch.tensor(masks_weak).float()
+            
+            return image, torch.tensor(bboxes),torch.tensor(bboxes_corse), torch.tensor(masks).float(), basename, image_weak, image_strong, torch.tensor(bboxes_weak), torch.tensor(masks_weak).float()
 
         elif self.cfg.visual:
             file_name = os.path.splitext(os.path.basename(name))[0]
