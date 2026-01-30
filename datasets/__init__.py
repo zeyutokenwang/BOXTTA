@@ -3,6 +3,7 @@ def call_load_dataset(cfg):
     print(cfg.out_dir, 'Loading')
 
     key = name.split("-")[0]
+    print(key)
     if 'tta' in cfg.out_dir:
         if 'BraTS' in name or 'mbh' in name:
             key = 'NII_test_changebox'

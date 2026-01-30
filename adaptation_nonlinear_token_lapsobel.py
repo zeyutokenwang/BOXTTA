@@ -21,37 +21,12 @@ from utils.eval_utils import AverageMeter, calc_iou, validate, get_prompts, vali
 from utils.tools import copy_model, create_csv, check_grad, momentum_update, reduce_instances
 import pandas as pd
 from PIL import Image, ImageDraw
-
-import numpy as np
-import torch
-import torch.nn as nn
+import cv2
 import torch.optim as optim
 try:  # SciPy >= 0.19
     from scipy.special import comb
 except ImportError:
     from scipy.misc import comb
-
-import torch
-import torch.nn as nn
-
-import torch
-import torch.nn as nn
-import numpy as np
-from PIL import Image
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from PIL import Image
-from math import comb
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from PIL import Image
-from math import comb
 
 import torch
 import torch.nn as nn
@@ -61,7 +36,19 @@ from PIL import Image
 from math import comb
 
 from utils.lapsobel import LearnableBezierTransform
+#from utils.nonlinear import LearnableBezierTransform
 
+def expand_bbox(x, y, w, h, width, height, expand_ratio=0.25):
+    new_w = w * (1 + expand_ratio)
+    new_h = h * (1 + expand_ratio)
+    
+    new_x = max(0, x - (new_w - w) / 2)
+    new_y = max(0, y - (new_h - h) / 2)
+    
+    new_x2 = min(width, x + w + (new_w - w) / 2)
+    new_y2 = min(height, y + h + (new_h - h) / 2)
+    
+    return new_x, new_y, new_x2, new_y2
 
 def train_sam(
     cfg: Box,
@@ -73,13 +60,13 @@ def train_sam(
     all_dataloader: DataLoader,
     num_iters: int,
 ):
-    """The SAM training loop."""
+    """The SAM training loop with Recursive Box Refinement."""
     data_time = AverageMeter()
     dice_loss = DiceLoss()
     end = time.time()
-    max_dice = 0.
-    num_epochs = 1  ## number of epochs, TTA was set to 1
-    #### uese for testing purposes
+    num_epochs = 1
+    
+    # --- 原有记录变量完全保留 ---
     dice_scores = AverageMeter()
     assd_scores = AverageMeter() 
     hd95_scores = AverageMeter() 
@@ -89,86 +76,79 @@ def train_sam(
     ent_losses = AverageMeter()
     total_losses = AverageMeter()
     case_results = []
-    anchor_model_free = copy_model(anchor_model)
-
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     transform_auto = LearnableBezierTransform().to(device)
     optimizer_auto = optim.Adam(transform_auto.parameters(), lr=0.1)
-    def lr_lambda(step):
-        # Decay rate for each step (0.999 for multiplicative decay)
-        decay_rate = 0.99
-        # Apply multiplicative decay at every step
-        return decay_rate ** step
-    # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer_auto, lr_lambda)
     
     for epoch in range(0, num_epochs):
         for iter, data in enumerate(all_dataloader):
             loss = 0.
             data_time.update(time.time() - end)
-            images_test, bboxes_test,bboxes_test_coarse, gt_masks_test, basenames, images_weak, images_strong, bboxes, gt_masks = data
-            ################################################
-            transformed_images = transform_auto(images_test[0],basenames[0])  # 输入单通道 [1, 1024, 1024]
-            transformed_images = transformed_images.unsqueeze(0)  # 扩展 batch 维度
-            batch_size = images_weak.size(0)
-            num_insts = sum(len(gt_mask) for gt_mask in gt_masks)
-            if num_insts > cfg.max_nums:
-                print(num_insts)
-                bboxes, gt_masks = reduce_instances(bboxes, gt_masks, cfg.max_nums)
-            ################################################
-
-            prompts = get_prompts(cfg, bboxes_test, gt_masks_test)
-            prompts_coarse = get_prompts(cfg, bboxes_test_coarse, gt_masks_test)
+            images_test, bboxes_test, bboxes_test_coarse, gt_masks_test, basenames, images_weak, images_strong, bboxes, gt_masks = data
+            
+            # 1. SBCT 转换
+            transformed_images = transform_auto(images_test[0], basenames[0]).unsqueeze(0)
+            batch_size = images_test.size(0)
+            
+            # --- 核心改进：闭环框校准逻辑 ---
+            # A. 第一次 Pass：获取 Teacher 模型的所有输出（包括 anchor_res_masks）
+            prompts_init = get_prompts(cfg, bboxes_test, gt_masks_test)
+            anchor_image_embeds, first_masks, first_iou_predictions, first_res_masks = model(transformed_images, prompts_init)
             with torch.no_grad():
-                anchor_image_embeds, anchor_masks, anchor_iou_predictions, anchor_res_masks = anchor_model(transformed_images, prompts)
-                # _, anchor_masks_coarse, _, anchor_res_masks_coarse = anchor_model_free(transformed_images, prompts)
-            pred_image_embeds, pred_masks, pred_iou_predictions, pred_res_masks = model(transformed_images, prompts)   
-            num_masks = sum(len(pred_mask) for pred_mask in pred_masks)
+                # 确保这里解包 4 个变量：embeds, masks, ious, res_masks
+                anchor_image_embeds, anchor_masks, anchor_iou_predictions, anchor_res_masks = anchor_model(transformed_images, prompts_init)
+            
+            # B. 使用 cv2.boundingRect 提取框并转换为 XYXY 格式
+            refined_bboxes_list = []
+            for i in range(batch_size):
+                # 提取掩码并转为 2D NumPy
+                mask_2d = (first_masks[i][0] > 0).cpu().numpy().astype(np.uint8).squeeze()
+                iou_score = first_iou_predictions[i].mean().item()
+                non_zero_pts = cv2.findNonZero(mask_2d)
+                
+                # 只有置信度高且真的有 Mask 时才校准
+                if iou_score > 0.2 and non_zero_pts is not None:
+                    # x, y 是左上角, w, h 是宽和高
+                    x, y, w, h = cv2.boundingRect(non_zero_pts)
+                    x1, y1, x2, y2 = expand_bbox(x, y, w, h, 1024, 1024, expand_ratio=0.0)
+                    
+                    # 构造 XYXY 格式的 Tensor
+                    refined_box = torch.tensor([[x1, y1, x2, y2]], device=fabric.device, dtype=torch.float32)
+                    refined_bboxes_list.append(refined_box)
+                else:
+                    # 如果校准失败，直接使用原始的 bboxes_test
+                    refined_bboxes_list.append(bboxes_test[i].to(fabric.device).float())
+            print("图像框信息")
+            print(bboxes_test[0])
+            print(refined_bboxes_list[0])
+            # C. 第二次 Pass
+            prompts_refined = get_prompts(cfg, refined_bboxes_list, gt_masks_test)
+
+            # 执行 Student 模型的前向传播（带梯度）
+            # 这里产生的变量名 pred_masks, pred_iou_predictions, pred_res_masks 将进入你下方的 zip 循环
+            # pred_image_embeds, pred_masks, pred_iou_predictions, pred_res_masks = model(transformed_images, prompts_refined)
+            
+            
+            num_masks = sum(len(pred_mask) for pred_mask in first_masks)
             loss_ent = torch.tensor(0., device=fabric.device)
             loss_dice = torch.tensor(0., device=fabric.device)
             loss_iou = torch.tensor(0., device=fabric.device)
 
-            for i, (pred_mask, anchor_mask, iou_prediction, anchor_res, pred_res) in enumerate(zip(pred_masks, anchor_masks, pred_iou_predictions, anchor_res_masks, pred_res_masks)):
+            for i, (pred_mask, anchor_mask, iou_prediction, anchor_res, pred_res) in enumerate(zip(first_masks, anchor_masks, first_iou_predictions, anchor_res_masks, first_res_masks)):
                 iou_score = iou_prediction.mean()
-                # anchor_mask_coarse = anchor_masks_coarse[i]
-                # anchor_mask_coarse = anchor_res_masks_coarse[i]
-                # anchor_mask_coarse = (anchor_mask_coarse > 0.).float()
-                # print(anchor_mask_coarse.shape, anchor_mask.shape, '111', anchor_mask_coarse.max(), anchor_mask.max(), anchor_mask_coarse.min(), anchor_mask.min())
-                # anchor_res = F.interpolate(anchor_res, size=pred_image_embeds[0].shape[-2:], mode="bilinear", align_corners=False).detach()
-                # pred_res = F.interpolate(pred_res, size=pred_image_embeds[0].shape[-2:], mode="bilinear", align_corners=False).detach()
-                anchor_mask = (anchor_mask > 0.).float()
-                anchor_res = (anchor_res > 0.).float()
-                # print(anchor_res.shape, pred_res.shape, '120', anchor_res.max(), pred_res.max(), anchor_res.min(), pred_res.min())
-                # print(anchor_image_embeds[i].shape,pred_res_masks[i].shape, anchor_res_masks[i].shape, '121', pred_res_masks[i].max(), anchor_res_masks[i].max(),pred_res_masks[i].min(), anchor_res_masks[i].min())
-                # print(pred_mask.shape, anchor_mask.shape, '122', pred_mask.max(), anchor_mask.max(),pred_mask.min(), anchor_mask.min())
-                # pred_mask_sig = F.sigmoid(pred_mask)
-                # pred_mask_sig = torch.clamp(pred_mask_sig, min=0, max=1)
-                # anchor_mask_sig = F.sigmoid(anchor_mask)
-                # anchor_mask_sig = torch.clamp(anchor_mask_sig, min=0, max=1)
-
-                # p = pred_mask_sig.view(pred_mask_sig.size(0), -1)  
-                # p_anchor = anchor_mask_sig.view(anchor_mask_sig.size(0), -1)  
-                # entropy_p = -p * torch.log(p + 1e-8) - (1 - p) * torch.log(1 - p + 1e-8)
-                # entropy_p_anchor = -p_anchor * torch.log(p_anchor + 1e-8) - (1 - p_anchor) * torch.log(1 - p_anchor + 1e-8)
-                # entropy_diff_abs = torch.abs(entropy_p - entropy_p_anchor)*0.01  
-                # loss_ent += entropy_diff_abs.mean()
+                anchor_mask = (anchor_mask > 0.).float().detach() # 伪标签脱离梯度
+                anchor_res = (anchor_res > 0.).float().detach()
+                
                 batch_iou = calc_iou(pred_mask, anchor_mask)
                 loss_iou += F.mse_loss(iou_prediction, batch_iou, reduction='sum') / num_masks
-                # loss_dice += dice_loss(pred_mask, anchor_mask)*(iou_prediction*iou_prediction*iou_prediction).mean()
                 loss_dice += dice_loss(pred_mask, anchor_mask)*(iou_score*iou_score*iou_score)
                 loss_dice += dice_loss(pred_res, anchor_res)*(iou_score*iou_score*iou_score)
                 loss_iou += (1.0 - iou_prediction.mean())
-                # loss_dice += dice_loss(pred_mask, anchor_mask_coarse)*((iou_prediction.mean()*iou_prediction.mean()*iou_prediction.mean()))
-                # loss_dice += dice_loss(pred_res, anchor_mask_coarse)*((iou_prediction.mean()*iou_prediction.mean()*iou_prediction.mean()))
-                # if iou_score > 1.0:
-                #     with torch.no_grad():
-                #         _, anchor_masks_coarse, _, anchor_res_masks_coarse = anchor_model_free(transformed_images, prompts)
-                #         anchor_mask_coarse = anchor_masks_coarse[i]
-                #         anchor_mask_coarse = (anchor_mask_coarse > 0.).float()
-                #     loss_dice += dice_loss(pred_mask, anchor_mask_coarse)
+                
             loss_total = loss_iou + loss_dice*0.5
 
             fabric.backward(loss_total)
-
             optimizer.step()
             optimizer_auto.step()
             scheduler.step()
@@ -198,30 +178,24 @@ def train_sam(
             fabric.log_dict(loss_logger)
             torch.cuda.empty_cache()
                 
-            ################################
             num_images = transformed_images.size(0)
             with torch.no_grad():
                 transformed_images = transform_auto(images_test[0], basenames[0]) 
                 transformed_images = transformed_images.unsqueeze(0)  
-                _, pred_masks, ious, _ = model(transformed_images, prompts)
-                # _, pred_masks, ious, _ = anchor_model(transformed_images, prompts)
+                _, pred_masks, ious, _ = model(transformed_images, prompts_refined)
                 for pred_mask, gt_mask, basename, iou in zip(pred_masks, gt_masks_test, basenames, ious):
                     pred_mask = (pred_mask > 0.5).float()
                     gt_mask = (gt_mask > 0.5).float()
 
-
             batch_dice, batch_assd, batch_hd95 = calculate_metrics(pred_mask, gt_mask)
-
             dice_scores.update(batch_dice, num_images)
             assd_scores.update(batch_assd, num_images)
             hd95_scores.update(batch_hd95, num_images)
 
             pred_mask_np = pred_mask.squeeze().cpu().numpy()  
             pred_mask_np = (pred_mask_np * 255).astype(np.uint8)  
-
             save_path = os.path.join(cfg.out_dir, f"{cfg.dataset}-{cfg.prompt}-pred_masks", f"{basename}.png")
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
             Image.fromarray(pred_mask_np).save(save_path)
 
             case_results.append({
@@ -230,9 +204,9 @@ def train_sam(
                 "ASSD": batch_assd, 
                 "HD95": batch_hd95
             })
-            
-
             fabric.print(f"{basename} Dice: {batch_dice:.4f} - Batch ASSD: {batch_assd:.4f} - Batch HD95: {batch_hd95:.4f}")
+
+    # --- 结尾统计代码完全保留 ---
     fabric.print(f'Test Ending...: Mean Dice: [{dice_scores.avg:.4f}] -- Mean ASSD: [{assd_scores.avg:.4f}] -- Mean HD95: [{hd95_scores.avg:.4f}]')
     case_results.append({
         "basename": "Average",  
@@ -242,16 +216,13 @@ def train_sam(
     })
 
     df = pd.DataFrame(case_results)
-
     if fabric.global_rank == 0:
         csv_path = os.path.join(cfg.out_dir, f"{cfg.dataset}-{cfg.prompt}-test-results.csv")
         df.to_csv(csv_path, index=False)
 
-    
-
-
     state = {"model": model, "optimizer": optimizer}
     fabric.save(os.path.join(cfg.out_dir, "save-ckpt", f"{cfg.dataset}-{cfg.prompt}-last-ckpt.pth"), state)
+
 
 #     return optimizer, scheduler
 def configure_opt(cfg: Box, model: Model):
@@ -347,7 +318,7 @@ def load_config(cfg_path: str, args: argparse.Namespace):
         cfg.prompt = args.prompt
     if args.gpu_ids:
         cfg.gpu_ids = args.gpu_ids
-    cfg.out_dir = "output/wjh_tta_nonl_001_iccv_4img/"+args.dataset
+    cfg.out_dir = "output/tokentta/"+args.dataset
 
     return cfg
 def set_seed(seed: int):

@@ -347,7 +347,7 @@ def load_config(cfg_path: str, args: argparse.Namespace):
         cfg.prompt = args.prompt
     if args.gpu_ids:
         cfg.gpu_ids = args.gpu_ids
-    cfg.out_dir = "output/wjh_tta_nonl_001_iccv_4img/"+args.dataset
+    cfg.out_dir = "output/wjh_tta/"+args.dataset
 
     return cfg
 def set_seed(seed: int):

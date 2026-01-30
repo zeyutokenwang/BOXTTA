@@ -87,7 +87,7 @@ class NIIDataset(Dataset):
         gt_masks = decode_mask(torch.tensor(gt_mask[None, :, :])).numpy().astype(np.uint8)
         assert gt_masks.sum() == (gt_mask > 0).sum()
         # 随机扰动参数，可根据需要调整
-        offset_factor = 0.1  # 偏移程度，范围0-1
+        offset_factor = 0.2  # 偏移程度，范围0-1
         
         for mask in gt_masks:
             masks.append(mask)
